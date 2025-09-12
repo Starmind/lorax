@@ -144,6 +144,10 @@ class FlashBert(Model):
         return False
 
     @property
+    def requires_block_allocator(self) -> bool:
+        return False
+
+    @property
     def supports_classification(self) -> bool:
         return self.classification_head_enabled
 
@@ -175,6 +179,8 @@ class FlashBert(Model):
             num_heads=self.num_heads,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_size,
+            # TODO: This is a hack to get the prefill state to work
+            window_left=0,
         )
 
     def forward(self, batch: FlashEmbeddingClassificationBatch):

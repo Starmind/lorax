@@ -278,6 +278,17 @@ def get_model(
             **flash_causal_lm_kwargs,
         )
 
+    if model_type == "solar":
+        from lorax_server.models.flash_solar import FlashSolar
+
+        return FlashSolar(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
+        )
+
     if model_type == "gemma":
         from lorax_server.models.flash_gemma import FlashGemma
 
@@ -367,6 +378,17 @@ def get_model(
             compile=compile,
             dtype=dtype,
             trust_remote_code=trust_remote_code,
+        )
+
+    if model_type == "granite":
+        from lorax_server.models.flash_granite import FlashGranite
+
+        return FlashGranite(
+            model_id,
+            adapter_id,
+            adapter_source,
+            revision,
+            **flash_causal_lm_kwargs,
         )
 
     raise ValueError(f"Unsupported model type {model_type}")

@@ -38,6 +38,7 @@ void bgmv_kernel(T *__restrict__ Y, const T *__restrict__ X,
     f(T, narrow, 6848) \
     f(T, narrow, 6912) \
     f(T, narrow, 7168) \
+    f(T, narrow, 7680) \
     f(T, narrow, 8192) \
     f(T, narrow, 8960) \
     f(T, narrow, 9216) \
@@ -50,6 +51,7 @@ void bgmv_kernel(T *__restrict__ Y, const T *__restrict__ X,
     f(T, narrow, 14336) \
     f(T, narrow, 15360) \
     f(T, narrow, 16384) \
+    f(T, narrow, 17920) \
     f(T, narrow, 18944) \
     f(T, narrow, 20480) \
     f(T, narrow, 22016) \
@@ -62,6 +64,7 @@ void bgmv_kernel(T *__restrict__ Y, const T *__restrict__ X,
     f(T, narrow, 32512) \
     f(T, narrow, 32768) \
     f(T, narrow, 33024) \
+    f(T, narrow, 35840) \
     f(T, narrow, 36864) \
     f(T, narrow, 43264) \
     f(T, narrow, 49152) \

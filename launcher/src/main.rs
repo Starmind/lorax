@@ -5,6 +5,7 @@ use hf_hub::{
 };
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
+use secrecy::{ExposeSecret, SecretBox};
 use serde::Deserialize;
 use std::env;
 use std::ffi::OsString;
@@ -277,6 +278,9 @@ struct Args {
     /// `gpt2` or `mistralai/Mistral-7B-Instruct-v0.1`.
     /// Or it can be a local directory containing the necessary files
     /// as saved by `save_pretrained(...)` methods of transformers
+    /// Optionally you can specify a revision with `@` like
+    /// `<model_id>@main` - this is incompatible with the `--revision`
+    /// flag.
     #[clap(default_value = "mistralai/Mistral-7B-Instruct-v0.1", long, env)]
     model_id: String,
 
@@ -342,13 +346,38 @@ struct Args {
 
     /// Whether you want to compile the model into a CUDA graph.
     /// This will speed up decoding but increase GPU memory usage.
+    /// Only use either `--compile` or `--eager`. Using both at the same time will
+    /// result in an error.
     #[clap(long, env, value_enum)]
     compile: bool,
+
+    /// Whether you want to run the model in eager mode, without
+    /// CUDA mode compilation, or run it with compilation.
+    /// Only use either `--compile` or `--eager`. Using both at the same time will
+    /// result in an error.
+    #[clap(long, env, value_enum)]
+    eager: bool,
+
+    // The maximum batch size past which CUDA graphs are disabled.
+    #[clap(default_value = "128", long, env)]
+    compile_max_batch_size: usize,
+
+    // The maximum adapter rank (LoRA) past which CUDA graphs are disabled.
+    #[clap(default_value = "64", long, env)]
+    compile_max_rank: usize,
+
+    // The initial batch size for model CUDA compilations
+    #[clap(default_value = "32", long, env)]
+    compile_batch_size: usize,
 
     /// The number of speculative tokens to generate in the model per step.
     /// Defaults to 0, meaning no speculative decoding.
     #[clap(long, env)]
     speculative_tokens: Option<usize>,
+
+    // The maximum batch size past which speculative decoding is disabled.
+    #[clap(default_value = "32", long, env)]
+    speculation_max_batch_size: usize,
 
     /// The list of adapter ids to preload during initialization (to avoid cold start times).
     #[clap(long, env)]
@@ -366,7 +395,7 @@ struct Args {
     /// The API token to use when fetching adapters from pbase.
     /// If specified, will set the environment variable PREDIBASE_API_TOKEN.
     #[clap(long, env)]
-    predibase_api_token: Option<String>,
+    predibase_api_token: Option<SecretBox<str>>,
 
     /// The dtype to be forced upon the model. This option cannot be used with `--quantize`.
     #[clap(long, env, value_enum)]
@@ -381,7 +410,7 @@ struct Args {
     /// The maximum amount of concurrent requests for this particular deployment.
     /// Having a low limit will refuse clients requests instead of having them
     /// wait for too long and is usually good to handle backpressure correctly.
-    #[clap(default_value = "128", long, env)]
+    #[clap(default_value = "1024", long, env)]
     max_concurrent_requests: usize,
 
     /// This is the maximum allowed value for clients to set `best_of`.
@@ -481,7 +510,7 @@ struct Args {
     /// Whether to prioritize running prefill before decode to increase batch size during decode (throughput) over
     /// liveness in earlier requests (latency). For batch use cases that are not latnecy sensitive, this should be set
     /// to true.
-    #[clap(long, env)]
+    #[clap(default_value = "true", long, env)]
     eager_prefill: Option<bool>,
 
     /// Split prefill requests into multiple chunks and batch them with decode requests. For high QPS scenarios, this
@@ -620,6 +649,9 @@ struct Args {
 
     #[clap(long, env)]
     disable_sgmv: bool,
+
+    #[clap(default_value = "0.9", long, env)]
+    memory_wiggle_room: f32,
 }
 
 #[derive(Debug)]
@@ -637,7 +669,12 @@ fn shard_manager(
     adapter_source: String,
     quantize: Option<Quantization>,
     compile: bool,
+    eager: bool,
+    compile_max_batch_size: usize,
+    compile_max_rank: usize,
+    compile_batch_size: usize,
     speculative_tokens: Option<usize>,
+    speculation_max_batch_size: usize,
     preloaded_adapter_ids: Vec<String>,
     preloaded_adapter_source: Option<String>,
     predibase_api_token: Option<String>,
@@ -665,6 +702,7 @@ fn shard_manager(
     _shutdown_sender: mpsc::Sender<()>,
     embedding_dim: Option<usize>,
     disable_sgmv: bool,
+    memory_wiggle_room: f32,
 ) {
     // Enter shard-manager tracing span
     let _span = tracing::span!(tracing::Level::INFO, "shard-manager", rank = rank).entered();
@@ -714,8 +752,12 @@ fn shard_manager(
     }
 
     // CUDA graph compilation
-    if compile {
+    if !eager {
         shard_args.push("--compile".to_string());
+    }
+
+    if compile && eager {
+        panic!("Cannot use both --compile and --eager at the same time.");
     }
 
     // Speculative decoding
@@ -725,6 +767,7 @@ fn shard_manager(
     }
 
     // Preloaded adapters
+    let has_preloaded_adapters = !preloaded_adapter_ids.is_empty();
     for adapter_id in preloaded_adapter_ids {
         shard_args.push("--preloaded-adapter-ids".to_string());
         shard_args.push(adapter_id);
@@ -787,20 +830,49 @@ fn shard_manager(
     ));
 
     // Adapter memory fraction
-    envs.push((
-        "ADAPTER_MEMORY_FRACTION".into(),
-        adapter_memory_fraction.to_string().into(),
-    ));
+    if has_preloaded_adapters {
+        envs.push(("ADAPTER_MEMORY_FRACTION".into(), "0".into()));
+    } else {
+        envs.push((
+            "ADAPTER_MEMORY_FRACTION".into(),
+            adapter_memory_fraction.to_string().into(),
+        ));
+    }
 
     // Prefix caching
     if let Some(prefix_caching) = prefix_caching {
-        envs.push(("PREFIX_CACHING".into(), prefix_caching.to_string().into()));
+        let prefix_caching = if prefix_caching { "1" } else { "0" };
+        envs.push(("PREFIX_CACHING".into(), prefix_caching.into()));
     }
 
     // Chunked prefill
     if let Some(chunked_prefill) = chunked_prefill {
-        envs.push(("CHUNKED_PREFILL".into(), chunked_prefill.to_string().into()));
+        let chunked_prefill = if chunked_prefill { "1" } else { "0" };
+        envs.push(("CHUNKED_PREFILL".into(), chunked_prefill.into()));
     }
+
+    // Compile max batch size and rank
+    envs.push((
+        "LORAX_COMPILE_MAX_BATCH_SIZE".into(),
+        compile_max_batch_size.to_string().into(),
+    ));
+
+    envs.push((
+        "LORAX_COMPILE_MAX_RANK".into(),
+        compile_max_rank.to_string().into(),
+    ));
+
+    // Compile initial batch size
+    envs.push((
+        "LORAX_COMPILE_BATCH_SIZE".into(),
+        compile_batch_size.to_string().into(),
+    ));
+
+    // Speculative decoding max batch size
+    envs.push((
+        "LORAX_SPECULATION_MAX_BATCH_SIZE".into(),
+        speculation_max_batch_size.to_string().into(),
+    ));
 
     // Backend
     if backend == Backend::FlashInfer {
@@ -810,6 +882,12 @@ fn shard_manager(
     if disable_sgmv {
         envs.push(("DISABLE_SGMV".into(), "1".into()))
     }
+
+    // Memory wiggle room
+    envs.push((
+        "MEMORY_WIGGLE_ROOM".into(),
+        memory_wiggle_room.to_string().into(),
+    ));
 
     // Safetensors load fast
     envs.push(("SAFETENSORS_FAST_GPU".into(), "1".into()));
@@ -940,6 +1018,18 @@ fn shard_manager(
         }
         sleep(Duration::from_millis(100));
     }
+}
+
+// Parse the model_id to extract the model and revision (in model@revision format). If the model_id string doesn't
+// encode a revision, return revision_fallback for revision (which may itself be None).
+fn get_model_and_revision(
+    model_id: &str,
+    revision_fallback: Option<String>,
+) -> (String, Option<String>) {
+    let mut parts = model_id.split('@');
+    let model_id = parts.next().unwrap().to_string();
+    let revision = parts.next().map(|s| s.to_string()).or(revision_fallback);
+    (model_id, revision)
 }
 
 fn shutdown_shards(shutdown: Arc<AtomicBool>, shutdown_receiver: &mpsc::Receiver<()>) {
@@ -1137,6 +1227,13 @@ fn download_convert_model(
         envs.push(("HUGGING_FACE_HUB_TOKEN".into(), api_token.into()))
     };
 
+    if let Some(predibase_api_token) = &args.predibase_api_token {
+        envs.push((
+            "PREDIBASE_API_TOKEN".into(),
+            predibase_api_token.expose_secret().into(),
+        ));
+    }
+
     // If args.weights_cache_override is some, pass it to the download process
     // Useful when running inside a HuggingFace Inference Endpoint
     if let Some(weights_cache_override) = &args.weights_cache_override {
@@ -1243,10 +1340,18 @@ fn spawn_shards(
         let otlp_endpoint = args.otlp_endpoint.clone();
         let quantize = args.quantize;
         let compile = args.compile;
+        let eager = args.eager;
+        let compile_max_batch_size = args.compile_max_batch_size;
+        let compile_max_rank = args.compile_max_rank;
+        let compile_batch_size = args.compile_batch_size;
         let speculative_tokens = args.speculative_tokens;
+        let speculation_max_batch_size = args.speculation_max_batch_size;
         let preloaded_adapter_ids = args.preloaded_adapter_ids.clone();
         let preloaded_adapter_source = args.preloaded_adapter_source.clone();
-        let predibase_api_token = args.predibase_api_token.clone();
+        let predibase_api_token = args
+            .predibase_api_token
+            .clone()
+            .unwrap_or(SecretBox::new("".into()));
         let dtype = args.dtype;
         let trust_remote_code = args.trust_remote_code;
         let master_port = args.master_port;
@@ -1261,6 +1366,7 @@ fn spawn_shards(
         let backend = args.backend;
         let embedding_dim = args.embedding_dim;
         let disable_sgmv = args.disable_sgmv;
+        let memory_wiggle_room = args.memory_wiggle_room;
         thread::spawn(move || {
             shard_manager(
                 model_id,
@@ -1270,10 +1376,15 @@ fn spawn_shards(
                 adapter_source,
                 quantize,
                 compile,
+                eager,
+                compile_max_batch_size,
+                compile_max_rank,
+                compile_batch_size,
                 speculative_tokens,
+                speculation_max_batch_size,
                 preloaded_adapter_ids,
                 preloaded_adapter_source,
-                predibase_api_token,
+                Some(String::from(predibase_api_token.expose_secret())),
                 dtype,
                 trust_remote_code,
                 uds_path,
@@ -1298,6 +1409,7 @@ fn spawn_shards(
                 shutdown_sender,
                 embedding_dim,
                 disable_sgmv,
+                memory_wiggle_room,
             )
         });
     }
@@ -1536,7 +1648,16 @@ fn terminate(process_name: &str, mut process: Child, timeout: Duration) -> io::R
 
 fn main() -> Result<(), LauncherError> {
     // Pattern match configuration
-    let args: Args = Args::parse();
+    let mut args: Args = Args::parse();
+
+    if args.model_id.contains('@') && args.revision.is_some() {
+        return Err(LauncherError::ArgumentValidation(
+            "Cannot specify a revision in both the --model_id and --revision flags".to_string(),
+        ));
+    }
+    // Extract the model id and revision from the model_id flag, if encoded in model@revision format (otherwise this
+    // is a no-op).
+    (args.model_id, args.revision) = get_model_and_revision(&args.model_id, args.revision);
 
     // Filter events with LOG_LEVEL
     let env_filter =
@@ -1617,13 +1738,6 @@ fn main() -> Result<(), LauncherError> {
             }
         }
     };
-
-    // Validate args
-    if max_input_tokens >= max_total_tokens {
-        return Err(LauncherError::ArgumentValidation(
-            "`max_input_length` must be < `max_total_tokens`".to_string(),
-        ));
-    }
 
     if args.validation_workers == 0 {
         return Err(LauncherError::ArgumentValidation(

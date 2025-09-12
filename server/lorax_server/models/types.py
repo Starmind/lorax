@@ -50,6 +50,7 @@ class Batch(ABC):
 class GeneratedText:
     text: str
     generated_tokens: int
+    skipped_tokens: int
     finish_reason: FinishReason
     seed: Optional[int]
 
@@ -57,22 +58,10 @@ class GeneratedText:
         return generate_pb2.GeneratedText(
             text=self.text,
             generated_tokens=self.generated_tokens,
+            skipped_tokens=self.skipped_tokens,
             finish_reason=self.finish_reason,
             seed=self.seed,
         )
-
-
-@dataclass
-class PrefillTokens:
-    token_ids: List[int]
-    logprobs: List[float]
-    texts: List[str]
-
-    def to_pb(self) -> generate_pb2.PrefillTokens:
-        return generate_pb2.PrefillTokens(ids=self.token_ids, logprobs=self.logprobs, texts=self.texts)
-
-    def __len__(self):
-        return len(self.token_ids)
 
 
 @dataclass
@@ -96,7 +85,7 @@ class NextTokens:
     is_special: List[bool]
     alternative_tokens: Optional[List[AlternativeTokens]]
 
-    def to_pb(self) -> generate_pb2.PrefillTokens:
+    def to_pb(self) -> generate_pb2.NextTokens:
         return generate_pb2.NextTokens(
             ids=self.token_ids,
             logprobs=self.logprobs,
@@ -116,7 +105,7 @@ class NextTokens:
 @dataclass
 class Generation:
     request_id: int
-    prefill_tokens: Optional[PrefillTokens]
+    prefill_tokens: Optional[NextTokens]
     prefill_tokens_length: int
     next_tokens: NextTokens
     generated_text: Optional[GeneratedText]

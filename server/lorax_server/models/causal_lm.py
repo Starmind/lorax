@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Type
 
 import torch
+from loguru import logger
 from opentelemetry import trace
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
 
@@ -12,7 +13,6 @@ from lorax_server.models.types import (
     GeneratedText,
     Generation,
     NextTokens,
-    PrefillTokens,
 )
 from lorax_server.pb import generate_pb2
 from lorax_server.utils import NextTokenChooser, Sampling, StoppingCriteria
@@ -500,7 +500,7 @@ class CausalLM(Model):
         trust_remote_code: bool = False,
     ):
         if compile:
-            raise ValueError("`--compile` is not supported with CausalLM")
+            logger.info(f"Model {model_id} does not support CUDA graph compilation. Skipping compilation.")
 
         if torch.cuda.is_available():
             device = torch.device("cuda")
@@ -679,7 +679,9 @@ class CausalLM(Model):
                     else:
                         seed = None
 
-                    generated_text = GeneratedText(output_text, stopping_criteria.current_tokens, reason, seed)
+                    generated_text = GeneratedText(
+                        output_text, stopping_criteria.current_tokens, stopping_criteria.current_skipped, reason, seed
+                    )
                 else:
                     generated_text = None
 
@@ -695,7 +697,7 @@ class CausalLM(Model):
                         clean_up_tokenization_spaces=False,
                         skip_special_tokens=False,
                     )
-                    prefill_tokens = PrefillTokens(prefill_token_ids, prefill_logprobs, prefill_texts)
+                    prefill_tokens = NextTokens(prefill_token_ids, prefill_logprobs, prefill_texts, None, None)
                     prefill_tokens_length = len(prefill_tokens.token_ids)
                 else:
                     prefill_tokens = None

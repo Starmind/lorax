@@ -292,6 +292,12 @@ def serve(
             local_url = unix_socket_template.format(uds_path, 0)
             server_urls = [local_url]
 
+        if adapter_source == PBASE and adapter_id != "":
+            logger.info("Got a PBASE adapter source, mapping model ID to S3")
+            api_token = os.getenv("PREDIBASE_API_TOKEN")
+            adapter_id = map_pbase_model_id_to_s3(adapter_id, api_token)
+            adapter_source = S3
+
         try:
             model = get_model(
                 model_id,
@@ -363,12 +369,18 @@ def serve(
                 for adapter_info in preloaded_adapters
             ]
             models = [model] * len(download_requests)
+            are_preloaded = [True] * len(download_requests)
 
             # Download adapters
             t0 = time.time()
             with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
                 download_responses = list(
-                    tqdm(executor.map(download_adapter, download_requests, models), total=len(download_requests))
+                    tqdm(
+                        executor.map(
+                            download_adapter, download_requests, models, are_preloaded
+                        ),
+                        total=len(download_requests),
+                    )
                 )
             logger.info(f"Downloaded {len(download_requests)} adapters in {time.time() - t0:.2f}s")
 
@@ -408,7 +420,11 @@ def serve(
             interceptors=[
                 ExceptionInterceptor(),
                 UDSOpenTelemetryAioServerInterceptor(),
-            ]
+            ],
+            options=[
+                # Set the maximum possible message length: i32::MAX
+                ("grpc.max_receive_message_length", (1 << 31) - 1)
+            ],
         )
         generate_pb2_grpc.add_LoraxServiceServicer_to_server(LoraxService(model, Cache(), server_urls), server)
         SERVICE_NAMES = (

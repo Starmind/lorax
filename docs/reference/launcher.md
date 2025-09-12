@@ -30,6 +30,16 @@ Options:
           [env: ADAPTER_SOURCE=]
           [default: hub]
 
+      --adapter-memory-fraction <ADAPTER_MEMORY_FRACTION>
+          Reservation of memory set aside for loading adapters onto the GPU.
+          Increasing this value will reduce the size of the KV cache in exchange for allowing more
+          adapters to be loaded onto the GPU at once.
+          This value is NOT scaled relative to `cuda_memory_fraction`, but is expressed in absolute terms.
+          This will be set to `0` if `preloaded_adapter_ids` are provided.
+
+          [env: ADAPTER_MEMORY_FRACTION=]
+          [default: 0.1]
+
       --revision <REVISION>
           The actual revision of the model if you're referring to a model on the hub. You can use a specific commit id or a branch like `refs/pr/2`
           
@@ -78,7 +88,7 @@ Options:
           The maximum amount of concurrent requests for this particular deployment. Having a low limit will refuse clients requests instead of having them wait for too long and is usually good to handle backpressure correctly
           
           [env: MAX_CONCURRENT_REQUESTS=]
-          [default: 128]
+          [default: 1024]
 
       --max-best-of <MAX_BEST_OF>
           This is the maximum allowed value for clients to set `best_of`. Best of makes `n` generations at the same time, and return the best in terms of overall log probability over the entire generated sequence
@@ -142,6 +152,13 @@ Options:
           
           [env: MAX_WAITING_TOKENS=]
           [default: 20]
+
+      --eager-prefill
+
+          Whether to prioritize running prefill before decode to increase batch size during decode (throughput) over
+          liveness in earlier requests (latency). This is set to true by default.
+
+          [default: true]
 
       --max-active-adapters <MAX_ACTIVE_ADAPTERS>
           Maximum number of adapters that can be placed on the GPU and accept requests at a time

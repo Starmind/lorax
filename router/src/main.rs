@@ -30,7 +30,7 @@ use tracing_subscriber::{EnvFilter, Layer};
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
 struct Args {
-    #[clap(default_value = "128", long, env)]
+    #[clap(default_value = "1024", long, env)]
     max_concurrent_requests: usize,
     #[clap(default_value = "2", long, env)]
     max_best_of: usize,
@@ -58,7 +58,7 @@ struct Args {
     port: u16,
     #[clap(default_value = "/tmp/lorax-server-0", long, env)]
     master_shard_uds_path: String,
-    #[clap(default_value = "bigscience/bloom", long, env)]
+    #[clap(long, env)]
     tokenizer_name: String,
     #[clap(long, env)]
     tokenizer_config_path: Option<String>,
@@ -134,13 +134,6 @@ async fn main() -> Result<(), RouterError> {
     } = args;
 
     init_logging(otlp_endpoint, json_output);
-
-    // Validate args
-    if max_input_length >= max_total_tokens {
-        return Err(RouterError::ArgumentValidation(
-            "`max_input_length` must be < `max_total_tokens`".to_string(),
-        ));
-    }
 
     if validation_workers == 0 {
         return Err(RouterError::ArgumentValidation(

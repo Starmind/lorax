@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Type
 
 import torch
+from loguru import logger
 from opentelemetry import trace
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, PreTrainedTokenizerBase
 
@@ -11,7 +12,6 @@ from lorax_server.models.types import (
     GeneratedText,
     Generation,
     NextTokens,
-    PrefillTokens,
 )
 from lorax_server.pb import generate_pb2
 from lorax_server.utils import NextTokenChooser, Sampling, StoppingCriteria
@@ -489,7 +489,7 @@ class Seq2SeqLM(Model):
         trust_remote_code: bool = False,
     ):
         if compile:
-            raise ValueError("`--compile` is not supported with Seq2SeqLM")
+            logger.info(f"Model {model_id} does not support CUDA graph compilation. Skipping compilation.")
 
         if torch.cuda.is_available():
             device = torch.device("cuda")
@@ -654,16 +654,20 @@ class Seq2SeqLM(Model):
                     else:
                         seed = None
 
-                    generated_text = GeneratedText(output_text, stopping_criteria.current_tokens, reason, seed)
+                    generated_text = GeneratedText(
+                        output_text, stopping_criteria.current_tokens, stopping_criteria.current_skipped, reason, seed
+                    )
                 else:
                     generated_text = None
 
                 # Prefill
                 if stopping_criteria.current_tokens == 1 and request.prefill_logprobs:
-                    prefill_tokens = PrefillTokens(
+                    prefill_tokens = NextTokens(
                         [self.tokenizer.bos_token_id],
                         [float("nan")],
                         [self.tokenizer.bos_token],
+                        None,
+                        None
                     )
                     prefill_tokens_length = len(prefill_tokens.token_ids)
                 else:

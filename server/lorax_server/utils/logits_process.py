@@ -1,12 +1,11 @@
 import math
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional
 
 import torch
 from transformers import (
     LogitsProcessor,
-    LogitsWarper,
     PreTrainedTokenizerBase,
     TemperatureLogitsWarper,
     TopKLogitsWarper,
@@ -15,7 +14,7 @@ from transformers import (
 )
 
 try:
-    from outlines.fsm.fsm import RegexFSM
+    from outlines.fsm.guide import RegexGuide
     from outlines.fsm.json_schema import build_regex_from_schema
 
     HAS_OUTLINES = True
@@ -86,6 +85,28 @@ def static_warper(
     return StaticWarper(temperature=temperature, top_k=top_k, top_p=top_p, typical_p=typical_p)
 
 
+class FrequencyPenaltyLogitsProcessor(LogitsProcessor):
+    r"""
+    Frequency penalty as defined by OpenAI
+
+    Args:
+        penalty (`float`):
+            The parameter for frequency penalty. 0.0 means no penalty.
+    """
+
+    def __init__(self, penalty: float):
+        self.penalty = penalty
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
+        score = torch.gather(scores, 1, input_ids)
+        # if score < 0 then penalty has to be multiplied to reduce the previous token probability
+        score = -torch.where(score < 0, score * self.penalty, score / self.penalty)
+        # set score to 0 where input_ids is a padding token
+        score *= input_ids.ne(0)
+
+        return scores.scatter_add_(1, input_ids, score)
+
+
 class HeterogeneousRepetitionPenaltyLogitsProcessor(LogitsProcessor):
     r"""
     [`LogitsProcessor`] enforcing an exponential penalty on repeated sequences.
@@ -119,7 +140,54 @@ class HeterogeneousRepetitionPenaltyLogitsProcessor(LogitsProcessor):
         return None
 
 
-class HeterogeneousTemperatureLogitsWarper(LogitsWarper):
+class HeterogeneousFrequencyPenaltyLogitsProcessor(LogitsProcessor):
+    r"""
+    Frequency penalty as defined by OpenAI in
+    https://platform.openai.com/docs/guides/text-generation/parameter-details
+
+    Args:
+        frequency_penalty (`List[float]`):
+            The parameter for frequency penalty. 0.0 means no penalty.
+        presence_penalty (`List[float]`):
+            The parameter for presence penalty. 0.0 means no penalty.
+    """
+
+    def __init__(
+        self, frequency_penalty: List[float], presence_penalty: List[float], dtype: torch.dtype, device: torch.device
+    ):
+        self.frequency_penalty = frequency_penalty
+        self.frequency_penalty_tensor = torch.tensor(frequency_penalty, dtype=dtype, device=device).unsqueeze(1)
+
+        self.presence_penalty = presence_penalty
+        self.presence_penalty_tensor = torch.tensor(presence_penalty, dtype=dtype, device=device).unsqueeze(1)
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        batch_size, input_size = input_ids.size()
+        vocab_size = scores.size(1)
+
+        # Calculate the frequency for each token so far
+        token_freq = torch.zeros(batch_size, vocab_size, device=input_ids.device)
+        token_freq.scatter_add_(1, input_ids, torch.ones_like(input_ids, dtype=torch.float))
+        mask = token_freq > 0
+        token_freq /= input_size
+
+        # Apply the frequency and presence penalties to logits
+        scores -= token_freq * self.frequency_penalty_tensor
+        scores -= mask * self.presence_penalty_tensor
+
+        return scores
+
+    def filter(self, indices):
+        self.frequency_penalty = [self.frequency_penalty[i] for i in indices]
+        self.presence_penalty = [self.presence_penalty[i] for i in indices]
+        if any([x != 0.0 for x in self.frequency_penalty]) or any([x != 0.0 for x in self.presence_penalty]):
+            self.frequency_penalty_tensor = self.frequency_penalty_tensor[indices]
+            self.presence_penalty_tensor = self.presence_penalty_tensor[indices]
+            return self
+        return None
+
+
+class HeterogeneousTemperatureLogitsWarper(LogitsProcessor):
     r"""
     [`LogitsWarper`] for temperature (exponential scaling output probability distribution).
     This version allows for a separate value for each sample and runs inplace when possible.
@@ -146,7 +214,7 @@ class HeterogeneousTemperatureLogitsWarper(LogitsWarper):
         return None
 
 
-class HeterogeneousTopPLogitsWarper(LogitsWarper):
+class HeterogeneousTopPLogitsWarper(LogitsProcessor):
     """
     [`LogitsWarper`] that performs top-p, i.e. restricting to top tokens summing to prob_cut_off <= prob_cut_off.
     This version allows for a separate value for each sample and runs inplace when possible.
@@ -201,7 +269,7 @@ class HeterogeneousTopPLogitsWarper(LogitsWarper):
         return None
 
 
-class HeterogeneousTopKLogitsWarper(LogitsWarper):
+class HeterogeneousTopKLogitsWarper(LogitsProcessor):
     r"""
     [`LogitsWarper`] that performs top-k, i.e. restricting to the k highest probability elements.
     This version allows for a separate value for each sample and runs inplace when possible.
@@ -278,7 +346,7 @@ class HeterogeneousTopKLogitsWarper(LogitsWarper):
         return None
 
 
-class HeterogeneousTypicalLogitsWarper(LogitsWarper):
+class HeterogeneousTypicalLogitsWarper(LogitsProcessor):
     r"""
     [`LogitsWarper`] that performs typical decoding. See [Typical Decoding for Natural Language
     Generation](https://arxiv.org/abs/2202.00666) for more information.
@@ -372,7 +440,7 @@ class HeterogeneousProcessorWrapper(LogitsProcessor):
 
     def __init__(
         self,
-        processors: Dict[int, Union[LogitsProcessor, LogitsWarper]],
+        processors: Dict[int, LogitsProcessor],
     ):
         self.processors = processors
 
@@ -482,26 +550,24 @@ class OutlinesLogitsProcessor(LogitsProcessor):
         if self.fsm_state == -1 or self.fsm is None:
             return scores
 
-        allowed_tokens = self.fsm.allowed_token_ids(self.fsm_state)
-
-        # Filter out tokens that are out of bounds
-        # TODO(travis): figure out why this happens
-        allowed_tokens = [t for t in allowed_tokens if t < scores.shape[-1]]
+        allowed_tokens = self.fsm.get_next_instruction(self.fsm_state).tokens
 
         mask = torch.full_like(scores, -math.inf, device=scores.device)
-        mask[:, allowed_tokens] = 0
+        if allowed_tokens is not None:
+            mask[:, allowed_tokens] = 0
         biased_scores = scores + mask
+
         return biased_scores
 
     def next_state(self, next_token_id: int):
         if self.fsm_state != -1:
-            self.fsm_state = self.fsm.next_state(self.fsm_state, next_token_id)
+            self.fsm_state = self.fsm.get_next_state(self.fsm_state, next_token_id)
 
     @staticmethod
     @lru_cache(maxsize=32, typed=True)
     def compile_fsm(schema, tokenizer):
         regex_string = build_regex_from_schema(schema)
-        return RegexFSM(regex_string, tokenizer)
+        return RegexGuide.from_regex(regex_string, tokenizer)
 
     @staticmethod
     @lru_cache(maxsize=32, typed=True)

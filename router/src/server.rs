@@ -5,21 +5,23 @@ use crate::health::Health;
 use crate::infer::{InferError, InferResponse, InferStreamResponse};
 use crate::tool_grammar::ToolGrammar;
 use crate::validation::ValidationError;
-use crate::{
-    default_json_schema, default_tool_prompt, AdapterParameters, AlternativeToken,
-    BatchClassifyRequest, BestOfSequence, ChatCompletionRequest, ChatCompletionResponse,
-    ChatCompletionResponseChoice, ChatCompletionStreamResponse, ChatCompletionStreamResponseChoice,
-    ChatMessage, ClassifyRequest, CompatGenerateRequest, CompletionFinishReason, CompletionRequest,
-    CompletionResponse, CompletionResponseChoice, CompletionResponseStreamChoice,
-    CompletionStreamResponse, Details, EmbedParameters, EmbedRequest, EmbedResponse, Entity,
-    ErrorResponse, FinishReason, FunctionDefinition, GenerateParameters, GenerateRequest,
-    GenerateResponse, HubModelInfo, Infer, Info, JsonSchema, LogProbs, Message,
-    OpenAiResponseFormat, PrefillToken, ResponseFormat, ResponseFormatType, SimpleToken,
-    StreamDetails, StreamResponse, Token, TokenizeRequest, TokenizeResponse, Tool, ToolCall,
-    ToolChoice, UsageInfo, Validation,
-};
 use crate::{json, HubPreprocessorConfig, HubProcessorConfig, HubTokenizerConfig};
+use crate::{
+    AdapterParameters, AlternativeToken, BatchClassifyRequest, BatchEmbedRequest, BestOfSequence,
+    ChatCompletionRequest, ChatCompletionResponse, ChatCompletionResponseChoice,
+    ChatCompletionStreamResponse, ChatCompletionStreamResponseChoice, ChatMessage, ClassifyRequest,
+    CompatEmbedRequest, CompatEmbedResponse, CompatEmbedding, CompatGenerateRequest,
+    CompletionFinishReason, CompletionRequest, CompletionResponse, CompletionResponseChoice,
+    CompletionResponseStreamChoice, CompletionStreamResponse, Details, EmbedParameters,
+    EmbedRequest, EmbedResponse, Entity, ErrorResponse, FinishReason, GenerateParameters,
+    GenerateRequest, GenerateResponse, HubModelInfo, Infer, Info, JsonSchema, LogProbs, Message,
+    OpenAiResponseFormat, PrefillToken, ResponseFormat, ResponseFormatType,
+    ReturnFunctionDefinition, SimpleToken, StreamDetails, StreamResponse, StringOrVec, Token,
+    TokenizeRequest, TokenizeResponse, Tool, ToolCall, ToolChoice, UsageInfo, Validation,
+};
 use axum::extract::Extension;
+use axum::extract::Query;
+use axum::http::header;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -33,7 +35,10 @@ use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use once_cell::sync::OnceCell;
 use reqwest_middleware::ClientBuilder;
 use reqwest_retry::{policies::ExponentialBackoff, RetryTransientMiddleware};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cmp;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
@@ -75,7 +80,18 @@ example = json ! ({"error": "Input validation error"})),
 example = json ! ({"error": "Incomplete generation"})),
 )
 )]
-#[instrument(skip(infer, req))]
+#[instrument(
+skip_all,
+fields(
+parameters = ? req.0.parameters,
+total_time,
+validation_time,
+queue_time,
+inference_time,
+time_per_token,
+seed,
+)
+)]
 async fn compat_generate(
     default_return_full_text: Extension<bool>,
     infer: Extension<Infer>,
@@ -86,6 +102,10 @@ async fn compat_generate(
     req_headers: HeaderMap,
     req: Json<CompatGenerateRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    // Log some useful headers to the span.
+    let span = tracing::Span::current();
+    trace_headers(req_headers.clone(), &span);
+
     let mut req = req.0;
 
     // default return_full_text given the pipeline_tag
@@ -142,7 +162,7 @@ example = json ! ({"error": "Input validation error"})),
 example = json ! ({"error": "Incomplete generation"})),
 )
 )]
-#[instrument(skip(infer, req))]
+#[instrument(skip(infer, req, req_headers))]
 async fn completions_v1(
     default_return_full_text: Extension<bool>,
     infer: Extension<Infer>,
@@ -153,6 +173,8 @@ async fn completions_v1(
     req_headers: HeaderMap,
     req: Json<CompletionRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let span = tracing::Span::current();
+    trace_headers(req_headers.clone(), &span);
     let mut req = req.0;
     if req.model == info.model_id.as_str() {
         // Allow user to specify the base model, but treat it as an empty adapter_id
@@ -227,7 +249,7 @@ example = json ! ({"error": "Input validation error"})),
 example = json ! ({"error": "Incomplete generation"})),
 )
 )]
-#[instrument(skip(infer, req))]
+#[instrument(skip(infer, req, req_headers))]
 async fn chat_completions_v1(
     default_return_full_text: Extension<bool>,
     infer: Extension<Infer>,
@@ -238,6 +260,8 @@ async fn chat_completions_v1(
     req_headers: HeaderMap,
     req: Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, Json<ErrorResponse>)> {
+    let span = tracing::Span::current();
+    trace_headers(req_headers.clone(), &span);
     let mut req = req.0;
     let model_id = info.model_id.clone();
     if req.model == info.model_id.as_str() {
@@ -246,107 +270,9 @@ async fn chat_completions_v1(
         req.model = "".to_string();
     }
 
-    let mut adapter_id = Some(req.model.clone());
-    if req.model == info.model_id.as_str() {
-        // Allow user to specify the base model, but treat it as an empty adapter_id
-        tracing::debug!("Replacing base model {0} with empty adapter_id", req.model);
-        adapter_id = None;
-    }
-
     let system_fingerprint = format!("{}-{}", info.version, info.docker_label.unwrap_or("native"));
-
-    // Modify input values to ResponseFormat to be OpenAI API compatible
-    let response_format: Option<ResponseFormat> = match req.response_format {
-        None => None,
-        Some(openai_format) => {
-            let response_format_type = openai_format.response_format_type.clone();
-            match response_format_type {
-                // Ignore when type is text
-                ResponseFormatType::Text => None,
-
-                // For json_object, use the fixed schema.
-                // For backwards compatibility, also support non-standard `schema` field
-                ResponseFormatType::JsonObject => openai_format.schema.map_or_else(
-                    || {
-                        Some(ResponseFormat {
-                            r#type: response_format_type.clone(),
-                            schema: default_json_schema(),
-                        })
-                    },
-                    |schema_value: serde_json::Value| {
-                        Some(ResponseFormat {
-                            r#type: response_format_type.clone(),
-                            schema: Some(schema_value),
-                        })
-                    },
-                ),
-
-                // For json_schema, use schema_value if available, otherwise fallback to the fixed schema
-                ResponseFormatType::JsonSchema => openai_format
-                    .json_schema
-                    .and_then(|schema| schema.schema)
-                    .map_or_else(
-                        || {
-                            Some(ResponseFormat {
-                                r#type: response_format_type.clone(),
-                                schema: default_json_schema(),
-                            })
-                        },
-                        |schema_value: serde_json::Value| {
-                            Some(ResponseFormat {
-                                r#type: response_format_type.clone(),
-                                schema: Some(schema_value),
-                            })
-                        },
-                    ),
-            }
-        }
-    };
-
-    let tool_prompt = req
-        .tool_prompt
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(default_tool_prompt);
-
-    let (inputs, response_format, using_tools) = prepare_chat_input(
-        &infer,
-        response_format,
-        req.tools,
-        req.tool_choice,
-        &tool_prompt,
-        req.guideline,
-        req.messages,
-    )?;
-
-    let mut gen_req = CompatGenerateRequest {
-        inputs: inputs.to_string(),
-        parameters: GenerateParameters {
-            adapter_id: adapter_id,
-            adapter_source: req.adapter_source,
-            adapter_parameters: None,
-            api_token: req.api_token,
-            best_of: req.n.map(|x| x as usize),
-            temperature: req.temperature,
-            repetition_penalty: req.repetition_penalty,
-            top_k: req.top_k,
-            top_p: req.top_p,
-            typical_p: None,
-            do_sample: !req.n.is_none(),
-            max_new_tokens: req.max_tokens.map(|x| x as u32),
-            ignore_eos_token: req.ignore_eos_token.unwrap_or(false),
-            return_full_text: None,
-            stop: req.stop,
-            truncate: None,
-            watermark: false,
-            details: true,
-            decoder_input_details: false,
-            return_k_alternatives: None,
-            apply_chat_template: false,
-            seed: req.seed,
-            response_format: response_format,
-        },
-        stream: req.stream.unwrap_or(false),
-    };
+    let (mut gen_req, using_tools): (CompatGenerateRequest, bool) =
+        req.try_into_generate(&infer)?;
 
     // default return_full_text given the pipeline_tag
     if gen_req.parameters.return_full_text.is_none() {
@@ -449,10 +375,13 @@ async fn chat_completions_v1(
                         (None, Some(content_message))
                     }
                     _ => {
+                        let arguments = serde_json::to_string(&arguments).map_err(|e| {
+                            InferError::ToolError(format!("Failed to serialize arguments: {}", e))
+                        })?;
                         let tool_calls = vec![ToolCall {
                             id: "0".to_string(),
                             r#type: "function".to_string(),
-                            function: FunctionDefinition {
+                            function: ReturnFunctionDefinition {
                                 description: None,
                                 name,
                                 arguments,
@@ -548,15 +477,15 @@ async fn get_model_info(info: Extension<Info>) -> Json<Info> {
 #[utoipa::path(
 get,
 tag = "LoRAX",
-path = "/health",
+path = "/startup",
 responses(
-(status = 200, description = "Everything is working fine"),
+(status = 200, description = "Everything is working fine and ready"),
 (status = 503, description = "LoRAX is down", body = ErrorResponse,
 example = json ! ({"error": "unhealthy", "error_type": "healthcheck"})),
 )
 )]
-/// Health check method
-async fn health(
+/// For k8s startup probe
+async fn is_startup_ready(
     infer: Extension<Infer>,
     health: Extension<Health>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
@@ -580,12 +509,12 @@ async fn health(
     if health.shard_info().supports_embeddings {
         let embed_request = EmbedRequest {
             inputs: "San Francisco".to_string(),
-            parameters: EmbedParameters {
+            parameters: Some(EmbedParameters {
                 adapter_id: None,
                 adapter_source: None,
                 adapter_parameters: None,
                 api_token: None,
-            },
+            }),
         };
         match infer.embed(embed_request).await {
             Ok(_) => {}
@@ -616,6 +545,8 @@ async fn health(
                 do_sample: false,
                 seed: None,
                 repetition_penalty: None,
+                frequency_penalty: None,
+                presence_penalty: None,
                 watermark: false,
                 return_full_text: None,
                 stop: vec![],
@@ -628,6 +559,7 @@ async fn health(
                 max_new_tokens: Some(1),
                 ignore_eos_token: false,
             },
+            add_special_tokens: true,
         };
         match infer.generate(generate_request).await {
             Ok(response) => {
@@ -653,6 +585,30 @@ async fn health(
         }
     }
     Ok(())
+}
+
+#[utoipa::path(
+get,
+tag = "LoRAX",
+path = "/health",
+responses(
+(status = 200, description = "Everything is working fine"),
+(status = 503, description = "LoRAX is down", body = ErrorResponse,
+example = json ! ({"error": "unhealthy", "error_type": "healthcheck"})),
+)
+)]
+/// Health check method
+async fn health(mut health: Extension<Health>) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    match health.check().await {
+        true => Ok(()),
+        false => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "unhealthy".to_string(),
+                error_type: "healthcheck".to_string(),
+            }),
+        )),
+    }
 }
 
 /// Generate tokens
@@ -695,6 +651,7 @@ async fn generate(
     mut req: Json<GenerateRequest>,
 ) -> Result<(HeaderMap, Json<GenerateResponse>), (StatusCode, Json<ErrorResponse>)> {
     let span = tracing::Span::current();
+    trace_headers(req_headers.clone(), &span);
     let start_time = Instant::now();
     metrics::increment_counter!("lorax_request_count");
 
@@ -731,13 +688,16 @@ async fn generate(
     // Inference
     let (response, best_of_responses) = match req.0.parameters.best_of {
         Some(best_of) if best_of > 1 => {
-            let (response, best_of_responses) = infer.generate_best_of(req.0, best_of).await?;
+            let (response, best_of_responses) = infer
+                .generate_best_of(req.0, best_of, infer.prefix_caching)
+                .await?;
             (response, Some(best_of_responses))
         }
         _ => (infer.generate(req.0).await?, None),
     };
 
     let generated_tokens = response.generated_text.generated_tokens;
+    let skipped_tokens = response.generated_text.skipped_tokens;
     let prompt_tokens = response.prompt_tokens;
     let total_tokens = prompt_tokens + generated_tokens;
 
@@ -773,6 +733,7 @@ async fn generate(
                 finish_reason: FinishReason::from(response.generated_text.finish_reason),
                 prompt_tokens: prompt_tokens,
                 generated_tokens: generated_tokens,
+                skipped_tokens: skipped_tokens,
                 prefill: response.prefill,
                 tokens: response.tokens,
                 seed: response.generated_text.seed,
@@ -788,6 +749,9 @@ async fn generate(
     let queue_time = response.start - response.queued;
     let inference_time = Instant::now() - response.start;
     let time_per_token = inference_time / response.generated_text.generated_tokens;
+    let time_to_first_token = response.prefill_time - response.start;
+    let time_per_output_token = (inference_time - time_to_first_token)
+        / cmp::max(response.generated_text.generated_tokens - 1, 1);
 
     // Rust Tracing metadata
     span.record("total_time", format!("{total_time:?}"));
@@ -795,9 +759,15 @@ async fn generate(
     span.record("queue_time", format!("{queue_time:?}"));
     span.record("inference_time", format!("{inference_time:?}"));
     span.record("time_per_token", format!("{time_per_token:?}"));
+    span.record("time_to_first_token", format!("{time_to_first_token:?}"));
+    span.record(
+        "time_per_output_token",
+        format!("{time_per_output_token:?}"),
+    );
     span.record("seed", format!("{:?}", response.generated_text.seed));
     span.record("prompt_tokens", format!("{prompt_tokens:?}"));
     span.record("generated_tokens", format!("{generated_tokens:?}"));
+    span.record("skipped_tokens", format!("{skipped_tokens:?}"));
 
     // Headers
     let mut headers = HeaderMap::new();
@@ -822,6 +792,10 @@ async fn generate(
         "x-generated-tokens",
         generated_tokens.to_string().parse().unwrap(),
     );
+    headers.insert(
+        "x-skipped-tokens",
+        skipped_tokens.to_string().parse().unwrap(),
+    );
     headers.insert("x-total-tokens", total_tokens.to_string().parse().unwrap());
     headers.insert(
         "x-validation-time",
@@ -838,6 +812,18 @@ async fn generate(
     headers.insert(
         "x-time-per-token",
         time_per_token.as_millis().to_string().parse().unwrap(),
+    );
+    headers.insert(
+        "x-time-to-first-token",
+        time_to_first_token.as_millis().to_string().parse().unwrap(),
+    );
+    headers.insert(
+        "x-time-per-output-token",
+        time_per_output_token
+            .as_millis()
+            .to_string()
+            .parse()
+            .unwrap(),
     );
 
     headers.insert("x-model-id", info.model_id.parse().unwrap());
@@ -1213,15 +1199,116 @@ async fn generate_stream_with_callback(
     (headers, stream)
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+struct MetricFamily {
+    r#type: String,
+    data: Vec<DataPoint>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct DataPoint {
+    key: String,
+    value: f64,
+}
+
+fn parse_text_to_metrics(text: &str) -> HashMap<String, MetricFamily> {
+    let mut metrics = HashMap::new();
+    let mut current_metric = String::new();
+
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+
+        if line.starts_with("# TYPE ") {
+            // Extract metric name from TYPE declaration
+            // # TYPE <metric_name> <metric_type>
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                current_metric = parts[2].to_string();
+                metrics.insert(
+                    current_metric.clone(),
+                    MetricFamily {
+                        r#type: parts[3].to_string(), // Metric type -> histogram, counter, etc
+                        data: Vec::new(),
+                    },
+                );
+                continue;
+            }
+        }
+
+        // Parse metric line if it belongs to current metric family
+        if let Some(metric_family) = metrics.get_mut(&current_metric) {
+            let mut parts = line.split_whitespace();
+            if let (Some(metric_name), Some(value_str)) = (parts.next(), parts.next()) {
+                if let Ok(value) = value_str.parse::<f64>() {
+                    let key = match metric_name {
+                        name if name.contains('{') => name.to_string(),
+                        name if name.ends_with("_sum") => "sum".to_string(),
+                        name if name.ends_with("_count") => "count".to_string(),
+                        _ => "".to_string(),
+                    };
+
+                    // Add the parsed metric data point
+                    metric_family.data.push(DataPoint { key, value });
+                }
+            }
+        }
+    }
+
+    metrics
+}
+
 /// Prometheus metrics scrape endpoint
 #[utoipa::path(
 get,
 tag = "LoRAX",
 path = "/metrics",
-responses((status = 200, description = "Prometheus Metrics", body = String))
+params(
+    ("format", Query, description = "Optional format parameter (prometheus|json)", example = "json")
+),
+responses(
+    (status = 200, description = "Prometheus or JSON Metrics",
+     content(
+         ("text/plain" = String),
+         ("application/json" = Object)
+     ))
+)
 )]
-async fn metrics(prom_handle: Extension<PrometheusHandle>) -> String {
-    prom_handle.render()
+async fn metrics(
+    prom_handle: Extension<PrometheusHandle>,
+    format: Option<Query<String>>,
+    headers: HeaderMap,
+) -> Response {
+    let want_json = format
+        .map(|f| f.0.to_lowercase() == "json")
+        .unwrap_or_else(|| {
+            headers
+                .get(header::ACCEPT)
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.contains("application/json"))
+                .unwrap_or(false)
+        });
+
+    let prometheus_text = prom_handle.render();
+
+    if want_json {
+        let metrics = parse_text_to_metrics(&prometheus_text);
+
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            Json(metrics),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain")],
+            prometheus_text,
+        )
+            .into_response()
+    }
 }
 
 async fn request_logger(
@@ -1380,12 +1467,8 @@ pub async fn run(
         max_input_length,
         max_total_tokens,
     );
-    let generation_health = Arc::new(AtomicBool::new(false));
-    let health_ext = Health::new(
-        client.clone(),
-        generation_health.clone(),
-        shard_info.clone(),
-    );
+    let inference_health = Arc::new(AtomicBool::new(false));
+    let health_ext = Health::new(client.clone(), inference_health.clone(), shard_info.clone());
 
     // For non-causal LMs, the max batch total tokens is equal to the max batch prefill tokens
     let is_causal_lm = shard_info.supports_generation;
@@ -1407,7 +1490,7 @@ pub async fn run(
         adapter_cycle_time_s,
         shard_info.requires_padding,
         shard_info.window_size,
-        generation_health,
+        inference_health,
         eager_prefill,
         tokenizer_config,
         arc_tokenizer,
@@ -1416,7 +1499,7 @@ pub async fn run(
         shard_info.preloaded_adapters,
         prefix_caching,
         shard_info.chunked_prefill,
-        is_causal_lm,
+        shard_info.requires_block_allocator,
     );
 
     // Duration buckets
@@ -1546,6 +1629,7 @@ pub async fn run(
         .route("/classify_batch", post(classify_batch))
         .route("/generate_stream", post(generate_stream))
         .route("/v1/completions", post(completions_v1))
+        .route("/v1/embeddings", post(compat_embed))
         .route("/v1/chat/completions", post(chat_completions_v1))
         // AWS Sagemaker route
         .route("/invocations", post(compat_generate));
@@ -1553,6 +1637,7 @@ pub async fn run(
     let info_routes = Router::new()
         .route("/", get(health))
         // Base Health route
+        .route("/startup", get(is_startup_ready))
         .route("/health", get(health))
         .route("/info", get(get_model_info))
         // AWS Sagemaker health route
@@ -1688,7 +1773,7 @@ impl From<InferError> for Event {
     post,
     tag = "Embedding",
     path = "/embed",
-    request_body = TokenizeRequest,
+    request_body = EmbedRequest,
     responses(
     (status = 200, description = "Embeddings ids", body = EmbedResponse),
     (status = 500, description = "Incomplete embedding", body = ErrorResponse),
@@ -1704,6 +1789,69 @@ async fn embed(
     // Inference
     let response = infer.embed(req).await?;
     Ok(Json(response))
+}
+
+/// Embed inputs
+#[utoipa::path(
+    post,
+    tag = "OpenAI Compatible",
+    path = "/v1/embeddings",
+    request_body = CompatEmbedRequest,
+    responses(
+    (status = 200, description = "Embeddings ids", body = CompatEmbedResponse),
+    (status = 500, description = "Incomplete embedding", body = ErrorResponse),
+    )
+)]
+#[instrument(skip_all)]
+#[axum::debug_handler]
+async fn compat_embed(
+    infer: Extension<Infer>,
+    Json(req): Json<CompatEmbedRequest>,
+) -> Result<Json<CompatEmbedResponse>, (StatusCode, Json<ErrorResponse>)> {
+    metrics::increment_counter!("lorax_request_count");
+    tracing::debug!("Input: {}", req.input);
+    if let StringOrVec::Vec(inputs) = req.input {
+        let batch_embed_req = BatchEmbedRequest {
+            inputs,
+            parameters: req.parameters,
+        };
+        let response = infer.embed_batch(batch_embed_req).await?;
+        let compat_embeddings = response
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| -> CompatEmbedding {
+                CompatEmbedding {
+                    index: i as i32,
+                    embedding: e.embeddings,
+                    object: "embedding".to_string(),
+                }
+            })
+            .collect();
+        Ok(Json(CompatEmbedResponse {
+            embeddings: compat_embeddings,
+        }))
+    } else if let StringOrVec::String(input) = req.input {
+        let embed_req = EmbedRequest {
+            inputs: input.to_string(),
+            parameters: req.parameters,
+        };
+        let response = infer.embed(embed_req).await?;
+        Ok(Json(CompatEmbedResponse {
+            embeddings: vec![CompatEmbedding {
+                index: 0,
+                embedding: response.embeddings,
+                object: "embedding".to_string(),
+            }],
+        }))
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Invalid input".to_string(),
+                error_type: "invalid_input".to_string(),
+            }),
+        ))
+    }
 }
 
 #[utoipa::path(
@@ -1771,6 +1919,13 @@ async fn classify(
         "lorax_request_inference_duration",
         inference_time.as_secs_f64()
     );
+    metrics::histogram!(
+        "lorax_request_classify_output_count",
+        response.predictions.len() as f64
+    );
+
+    tracing::debug!("Output: {:?}", response.predictions);
+    tracing::info!("Success");
 
     Ok((headers, Json(response.predictions)))
 }
@@ -1779,7 +1934,7 @@ async fn classify(
     post,
     tag = "ClassifyBatch",
     path = "/classify_batch",
-    request_body = TokenizeRequest,
+    request_body = BatchClassifyRequest,
     responses(
     (status = 200, description = "Classifications", body = BatchClassifyResponse),
     (status = 500, description = "Incomplete classification", body = ErrorResponse),
@@ -1855,7 +2010,19 @@ async fn classify_batch(
         inference_time.as_secs_f64()
     );
 
-    let batch_entity_vec = responses.into_iter().map(|r| r.predictions).collect();
+    let batch_entity_vec: Vec<Vec<Entity>> = responses
+        .into_iter()
+        .map(|r| {
+            let entity_vec = r.predictions;
+            metrics::histogram!(
+                "lorax_request_classify_output_count",
+                entity_vec.len() as f64
+            );
+            entity_vec
+        })
+        .collect();
+    tracing::debug!("Output: {:?}", batch_entity_vec);
+    tracing::info!("Success");
     Ok((headers, Json(batch_entity_vec)))
 }
 
@@ -1910,4 +2077,16 @@ async fn tokenize(
             }),
         ))
     }
+}
+
+fn trace_headers(headers: HeaderMap, span: &tracing::Span) {
+    headers
+        .get("x-predibase-tenant")
+        .map(|value| span.record("x-predibase-tenant", value.to_str().unwrap_or("unknown")));
+    headers
+        .get("user-agent")
+        .map(|value| span.record("user-agent", value.to_str().unwrap_or("unknown")));
+    headers
+        .get("x-b3-traceid")
+        .map(|value| span.record("x-b3-traceid", value.to_str().unwrap_or("")));
 }

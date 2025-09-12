@@ -17,7 +17,7 @@ service LoraxService {
     rpc Prefill (PrefillRequest) returns (PrefillResponse);
     /// Embed
     rpc Embed (EmbedRequest) returns (EmbedResponse);
-    /// Classify 
+    /// Classify
     rpc Classify (ClassifyRequest) returns (ClassifyResponse);
     /// Decode token for a list of prefilled batches
     rpc Decode (DecodeRequest) returns (DecodeResponse);
@@ -58,6 +58,7 @@ message InfoResponse {
     bool supports_embeddings = 9;
     bool supports_classification = 10;
     bool chunked_prefill = 11;
+    bool requires_block_allocator = 12;
 }
 
 /// Empty request
@@ -91,14 +92,18 @@ message NextTokenChooserParameters {
     uint64 seed = 6;
     /// repetition penalty
     float repetition_penalty = 7;
+    /// frequency penalty
+    float frequency_penalty = 8;
+    /// presence penalty
+    float presence_penalty = 9;
     /// token watermarking using "A Watermark for Large Language Models"
-    bool watermark = 8;
+    bool watermark = 10;
     /// adapter to use with lora exchange
-    string adapter_id = 9;
+    string adapter_id = 11;
     /// JSON schema used for constrained decoding (Outlines)
-    optional string schema = 10;
+    optional string schema = 12;
     /// returning the k highest probability alternatives
-    uint32 return_k_alternatives = 11;
+    uint32 return_k_alternatives = 13;
 }
 
 message StoppingCriteriaParameters {
@@ -114,11 +119,11 @@ message StoppingCriteriaParameters {
 message Image {
     /// Binary image data.
     bytes data = 1;
-  
+
     /// Image MIME type.
     string mimetype = 2;
   }
-  
+
 message InputChunk {
     oneof chunk {
       /// Plain text data
@@ -202,19 +207,12 @@ message GeneratedText {
     string text = 1;
     /// Number of generated tokens
     uint32 generated_tokens = 2;
+    /// Number of skipped tokens due to speculative decoding hits
+    uint32 skipped_tokens = 3;
     /// Finish reason
-    FinishReason finish_reason = 3;
+    FinishReason finish_reason = 4;
     /// Seed
-    optional uint64 seed = 4;
-}
-
-message PrefillTokens {
-    /// Prefill Token IDs
-    repeated uint32 ids = 1;
-    /// Prefill Logprobs
-    repeated float logprobs = 2;
-    /// Prefill tokens
-    repeated string texts = 3;
+    optional uint64 seed = 5;
 }
 
 message AlternativeTokens {
@@ -243,7 +241,7 @@ message Generation {
     /// Request ID
     uint64 request_id = 1;
     /// Prefill tokens (optional)
-    PrefillTokens prefill_tokens = 2;
+    NextTokens prefill_tokens = 2;
     /// Next tokens
     NextTokens next_tokens = 3;
     /// Complete generated text
@@ -334,7 +332,7 @@ message Entity {
 message EntityList {
     /// Request ID
     uint64 request_id = 1;
-    /// Entities 
+    /// Entities
     repeated Entity entities = 2;
     /// XXX
     repeated uint32 input_ids = 4;

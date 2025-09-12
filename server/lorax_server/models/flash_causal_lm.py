@@ -24,6 +24,7 @@ from lorax_server.models.metadata_kernels import (
 )
 from lorax_server.models.model import Model
 from lorax_server.models.types import (
+    AlternativeTokens,
     Batch,
     GeneratedText,
     Generation,
@@ -105,7 +106,7 @@ class FlashCausalLMBatch(Batch):
     prefilling_mask_tensor: Optional[torch.Tensor]
 
     # Prefill metadata tensors to efficiently compute logprobs
-    # tensor of length b+1 containing the cumulative sequence lengths of the sequences in the batch, only used in prefill
+    # tensor of length b+1 containing the cumulative sequence lengths of the sequences in the batch, only used in prefill  # noqa: E501
     cu_seqlen_prefill: Optional[torch.Tensor]
     # Prefill cache indices is used to slice into the kv tensor before caching it into the paged attention buffers
     # as we only keep SLIDING_WINDOW values instead of the whole tensor
@@ -185,13 +186,16 @@ class FlashCausalLMBatch(Batch):
         if batch_tokenized_inputs is None:
             batch_inputs = []
             max_truncation = 0
-            for r in pb.requests:
-                inputs = tokenizers.get_inputs(r, tokenizer)
+            for request in pb.requests:
+                inputs = tokenizers.get_inputs(request, tokenizer)
                 batch_inputs.append(inputs)
-                max_truncation = max(max_truncation, r.truncate)
+                max_truncation = max(max_truncation, request.truncate)
 
-            if all(r.HasField("tokenized_inputs") and len(r.tokenized_inputs.ids) > 0 for r in pb.requests):
-                batch_tokenized_inputs = [r.tokenized_inputs.ids[-max_truncation:] for r in pb.requests]
+            if all(
+                request.HasField("tokenized_inputs") and len(request.tokenized_inputs.ids) > 0
+                for request in pb.requests
+            ):
+                batch_tokenized_inputs = [request.tokenized_inputs.ids[-max_truncation:] for request in pb.requests]
             else:
                 batch_tokenized_inputs = tokenizer(batch_inputs, truncation=True, max_length=max_truncation)[
                     "input_ids"
@@ -224,24 +228,24 @@ class FlashCausalLMBatch(Batch):
         block_tables_ragged = []
 
         # Parse batch
-        for i, (r, tokenized_input) in enumerate(zip(pb.requests, batch_tokenized_inputs)):
+        for i, (request, tokenized_input) in enumerate(zip(pb.requests, batch_tokenized_inputs)):
             # request id -> idx in list mapping
-            requests_idx_mapping[r.id] = i
+            requests_idx_mapping[request.id] = i
 
-            tokenized_input = tokenized_input[-r.truncate :]
+            tokenized_input = tokenized_input[-request.truncate :]
 
             prompt_length = len(tokenized_input)
             prompt_lengths.append(prompt_length)
 
-            cache_length = r.cache_len
+            cache_length = request.cache_len
             assert cache_length <= prompt_length, f"Prefix {cache_length} vs input {prompt_length}"
             if cache_length == prompt_length:
                 assert False, "unreachable"
 
             # `chunk_len` is an optional field in the protobuf
             # It is only set if the model support chunking
-            if r.HasField("chunk_len"):
-                input_length = r.chunk_len
+            if request.HasField("chunk_len"):
+                input_length = request.chunk_len
 
                 if cache_length + input_length < prompt_length:
                     # FIXME: speculate is not supported for context chunking at the moment
@@ -264,9 +268,9 @@ class FlashCausalLMBatch(Batch):
             all_postfix_ids.append(postfix_ids)
             all_input_ids.append(tokenized_input)
 
-            next_token_chooser_parameters.append(r.parameters)
+            next_token_chooser_parameters.append(request.parameters)
 
-            stopping_criteria = StoppingCriteria.from_pb(r.stopping_parameters, tokenizer)
+            stopping_criteria = StoppingCriteria.from_pb(request.stopping_parameters, tokenizer)
             max_new_tokens = stopping_criteria.max_new_tokens
             stopping_criterias.append(stopping_criteria)
 
@@ -278,13 +282,13 @@ class FlashCausalLMBatch(Batch):
             block_tokens = prompt_length + max_new_tokens - 1 + speculative_tokens
 
             # blocks and slots can be empty (for example in warmup)
-            if not r.blocks:
+            if not request.blocks:
                 needed_blocks = math.ceil(block_tokens / BLOCK_SIZE)
                 request_blocks = [b for b in range(num_blocks, num_blocks + needed_blocks)]
                 request_slots = [s for b in request_blocks for s in range(b * BLOCK_SIZE, (b + 1) * BLOCK_SIZE)]
             else:
-                request_blocks = r.blocks
-                request_slots = r.slots
+                request_blocks = request.blocks
+                request_slots = request.slots
 
             block_tables.append(request_blocks)
             block_tables_ragged.extend(request_blocks)
@@ -1114,15 +1118,6 @@ class FlashCausalLM(Model):
         weights._set_config(model_id, config)
 
         self._supports_embeddings = embedding_dim is not None
-        if (
-            not (weights.has_tensor("lm_head.weight") or weights.has_tensor("language_model.lm_head.weight"))
-            and not self._supports_embeddings
-        ):
-            raise ValueError(
-                "Model does not have lm head so it is presumed to be for embeddings."
-                "No embedding_dim was provided so we cannot load the model."
-                "Please pass in an embedding_dim to the model."
-            )
 
         prefix = ""
         model = model_cls(prefix, config, weights)
@@ -1187,6 +1182,7 @@ class FlashCausalLM(Model):
             SLIDING_WINDOW_BLOCKS = math.ceil(sliding_window / BLOCK_SIZE)
 
         self.compile = compile
+
         self.model_graph_wrapper: GraphCache = None
         self.kv_cache = []
 
@@ -1277,7 +1273,26 @@ class FlashCausalLM(Model):
         total_gpu_memory = torch.cuda.get_device_properties(self.device).total_memory
         return ADAPTER_MEMORY_FRACTION * total_gpu_memory
 
+
+    def init_graph_wrapper(self, max_total_tokens: int):
+        self.model_graph_wrapper = GraphCache(
+            self.model,
+            self.device,
+            self.kv_cache,
+            self.adapter_layers,
+            self.traced_adapter_layers,
+            self._forward_context,
+            max_total_tokens,
+            self.num_heads,
+            self.num_kv_heads,
+            self.sliding_window_blocks,
+            self.layer_to_lora_weights,
+            self.punica_wrapper,
+        )
+
     def warmup(self, batch: FlashCausalLMBatch, max_new_tokens: int, embedding_model: bool = False):
+        logger.info(f'Pre warmup cuda memory: {get_cuda_free_memory(self.device, 1) / (1024 ** 3):.2f} GB')
+
         # The warmup batch is the biggest batch we could ever receive
         max_total_tokens = batch.max_input_length + max_new_tokens + get_speculative_tokens()
 
@@ -1301,6 +1316,7 @@ class FlashCausalLM(Model):
                 self.kv_dtype,
                 self.device,
             )
+            logger.info(f'Pre warmup kv init cuda memory: {get_cuda_free_memory(self.device, 1) / (1024 ** 3):.2f} GB')
 
             if not embedding_model:
                 with warmup_mode():
@@ -1327,47 +1343,36 @@ class FlashCausalLM(Model):
 
         graph_cache_memory = 0
         if self.compile:
-            if self.world_size > 1:
-                raise ValueError("Cannot enable `--compile` when sharding across multiple GPUs")
-
             # Estimate the memory overhead from CUDA graphs so we can subtract it from the kv cache.
             # Needs to be estimated here rather than fully initialized as the graph cache relies on the
             # cache manager being set.
-            self.model_graph_wrapper = GraphCache(
-                self.model,
-                self.device,
-                self.kv_cache,
-                self.adapter_layers,
-                self.traced_adapter_layers,
-                self._forward_context,
-                max_total_tokens,
-                self.num_heads,
-                self.num_kv_heads,
-                self.sliding_window_blocks,
-                self.layer_to_lora_weights,
-                self.punica_wrapper,
-            )
+            self.init_graph_wrapper(max_total_tokens)
             graph_cache_memory = self.model_graph_wrapper.get_estimated_cache_memory()
             logger.info("Estimated graph cache memory: {} MB", graph_cache_memory / 1024 / 1024)
             torch.cuda.synchronize(self.device)
 
+        logger.info(f'Post warmup cuda memory: {get_cuda_free_memory(self.device, 1) / (1024 ** 3):.2f} GB')
+        self.model_graph_wrapper = None
+        self.kv_cache = []
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
+        logger.info(f'Post warmup empty_cache cuda memory: {get_cuda_free_memory(self.device, 1) / (1024 ** 3):.2f} GB')
         # Inspired by the original implementation in [vllm](https://github.com/vllm-project/vllm)
         # Calculate the number of blocks that can be allocated with the free memory
         dtype_size = torch.tensor([], dtype=self.dtype).element_size()
         cache_block_size = BLOCK_SIZE * self.num_kv_heads * self.head_size
         total_cache_size = self.num_layers * cache_block_size * 2 * dtype_size
 
-        free_memory = get_cuda_free_memory(self.device, MEMORY_FRACTION - ADAPTER_MEMORY_FRACTION)
-        free_memory -= graph_cache_memory
+        preloaded_adapter_memory_fraction = sum(self.preloaded_adapter_memory_fractions.values())
+        free_memory = get_cuda_free_memory(
+            self.device,
+            MEMORY_FRACTION - ADAPTER_MEMORY_FRACTION - preloaded_adapter_memory_fraction
+        )
+        free_memory = max(0, free_memory - graph_cache_memory)
         logger.info("Memory remaining for kv cache: {} MB", free_memory / 1024 / 1024)
 
-        batch_num_blocks = batch.num_blocks if batch is not None else 0
-        num_blocks = (
-            # Leave 5% for some wiggle room
-            int((free_memory * MEMORY_WIGGLE_ROOM) // total_cache_size)
-            # Add batch.num_blocks as we allocated it above, so it is included in the peak memory.
-            + batch_num_blocks
-        )
+        num_blocks = int((free_memory * MEMORY_WIGGLE_ROOM) // total_cache_size)
+        logger.info(f"num kv blocks: {num_blocks}, num kv tokens: {num_blocks * BLOCK_SIZE}")
 
         del batch
 
@@ -1382,7 +1387,8 @@ class FlashCausalLM(Model):
 
         torch.cuda.synchronize(self.device)
 
-        if self.model_graph_wrapper is not None:
+        if self.compile:
+            self.init_graph_wrapper(max_total_tokens)
             # Warmup the graph cache. Needs to be done after setting cache manager as
             # tracing will use the static kv cache tensors
             self.model_graph_wrapper.kv_cache = self.kv_cache
@@ -1519,10 +1525,10 @@ class FlashCausalLM(Model):
             if FLASH_INFER:
                 block_tables = block_tables_to_ragged(
                     block_tables=block_tables,
-                    input_lengths=batch.input_lengths,
-                    cache_lengths=batch.cache_lengths,
-                    input_lengths_tensor=batch.input_lengths_tensor,
-                    cache_lengths_tensor=batch.cache_lengths_tensor,
+                    input_lengths=input_lengths.tolist(),
+                    cache_lengths=cache_lengths_tensor.tolist(),
+                    input_lengths_tensor=input_lengths,
+                    cache_lengths_tensor=cache_lengths_tensor,
                     max_current_length=max_s,
                 )
 
@@ -1576,6 +1582,11 @@ class FlashCausalLM(Model):
 
         return out
 
+    # note(ajinkya): hack needed to make sure that we can target cross_attn layers in mllama
+    # default behavior is to just return prefill state, but mllama always returns True
+    def adapter_prefill_state(self, prefill: bool) -> bool:
+        return prefill
+
     @tracer.start_as_current_span("generate_token")
     def generate_token(
         self, batch: FlashCausalLMBatch, is_warmup: bool = False
@@ -1603,13 +1614,14 @@ class FlashCausalLM(Model):
 
         # Assign pointers to adapter weights
         # TODO(travis): don't update this if indices haven't changed
-        self.punica_wrapper.update_metadata(adapter_meta, prefill)
+        adapter_prefill_state = self.adapter_prefill_state(prefill)
+        self.punica_wrapper.update_metadata(adapter_meta, adapter_prefill_state)
         adapter_data = AdapterBatchData.from_meta(
             adapter_meta,
             self.layer_to_adapter_weights,
             self.layer_to_lora_weights,
             self.punica_wrapper,
-            prefill,
+            adapter_prefill_state,
             batch.prefill_head_indices,
         )
 
@@ -1750,7 +1762,8 @@ class FlashCausalLM(Model):
                 # Only save tokens if we are done prefilling for this request
                 batch.all_input_ids_tensor[
                     i,
-                    batch.cache_lengths_tensor[i] + batch.input_lengths[i] : batch.cache_lengths_tensor[i]
+                    batch.cache_lengths_tensor[i]
+                    + batch.input_lengths[i] : batch.cache_lengths_tensor[i]
                     + batch.input_lengths[i]
                     + accepted_ids[i],
                 ] = next_input_ids[cu_accepted_ids[i] : cu_accepted_ids[i + 1]]
@@ -1886,36 +1899,6 @@ class FlashCausalLM(Model):
         ) in enumerate(iterator):
             all_alternative_tokens = [] if request.parameters.return_k_alternatives > 0 else None
 
-            # TODO(travis): return_k_alternatives
-            # if request.parameters.return_k_alternatives > 0:
-            #         # Limit the number of alternatives to the vocabulary size
-            #         num_alternatives = min(
-            #             request.parameters.return_k_alternatives,
-            #             len(alternative_token_ids[token_idx]),
-            #         )
-
-            #         # Select top-k logprobs
-            #         request_alternative_token_ids = alternative_token_ids[token_idx][:num_alternatives]
-            #         request_alternative_token_logprobs = alternative_token_logprobs[token_idx][:num_alternatives]
-
-            #         # Decode tokens
-            #         request_alternative_token_texts = []
-            #         for alternative_token_id in request_alternative_token_ids:
-            #             all_input_ids.append(alternative_token_id)
-            #             alternative_token_text, _, _ = self.decode_token(
-            #                 all_input_ids,
-            #                 prefix_offset,
-            #                 read_offset,
-            #             )
-            #             request_alternative_token_texts.append(alternative_token_text)
-            #             all_input_ids.pop()
-            #         alternative_tokens = AlternativeTokens(
-            #             request_alternative_token_ids,
-            #             request_alternative_token_logprobs,
-            #             request_alternative_token_texts,
-            #         )
-            #         all_alternative_tokens.append(alternative_tokens)
-
             # Compute logprobs first as, even though we might skip the token,
             # it can still be required to compute the logprobs
             # modulo on request.id as it is robust to batch.filter whereas the index in the batch is not and we need
@@ -1980,6 +1963,8 @@ class FlashCausalLM(Model):
                 if n_accepted_ids > 1:
                     logger.debug(f"speculated ids {n_accepted_ids - 1}")
 
+                # First token is not skipped, next tokens are
+                skipped = False
                 current_stopped = False
                 for j in range(index, index + n_accepted_ids):
                     # Generated token
@@ -1992,11 +1977,43 @@ class FlashCausalLM(Model):
                     )
                     next_token_texts.append(next_token_text)
 
+                    if request.parameters.return_k_alternatives > 0:
+                        # Limit the number of alternatives to the vocabulary size
+                        num_alternatives = min(
+                            request.parameters.return_k_alternatives,
+                            len(alternative_token_ids[j]),
+                        )
+
+                        # Select top-k logprobs
+                        request_alternative_token_ids = alternative_token_ids[j][:num_alternatives]
+                        request_alternative_token_logprobs = alternative_token_logprobs[j][:num_alternatives]
+
+                        # Decode tokens
+                        request_alternative_token_texts = []
+                        for alternative_token_id in request_alternative_token_ids:
+                            all_input_ids.append(alternative_token_id)
+                            alternative_token_text, _, _ = self.decode_token(
+                                all_input_ids,
+                                prefix_offset,
+                                read_offset,
+                            )
+                            request_alternative_token_texts.append(alternative_token_text)
+                            all_input_ids.pop()
+                        alternative_tokens = AlternativeTokens(
+                            request_alternative_token_ids,
+                            request_alternative_token_logprobs,
+                            request_alternative_token_texts,
+                        )
+                        all_alternative_tokens.append(alternative_tokens)
+
                     stop, reason = stopping_criteria(
                         next_token_id,
                         next_token_text,
+                        skipped=skipped,
                     )
 
+                    # All subsequent tokens are skipped
+                    skipped = True
                     if stop:
                         left = index + n_accepted_ids - j - 1
                         current_stopped = True
@@ -2022,6 +2039,7 @@ class FlashCausalLM(Model):
                         generated_text = GeneratedText(
                             output_text,
                             stopping_criteria.current_tokens,
+                            stopping_criteria.current_skipped,
                             reason,
                             seed if do_sample else None,
                         )
